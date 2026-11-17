@@ -17,9 +17,15 @@ open LeanExpr
 let __ () = assert false
 let invalid = Constr.(mkApp (mkSet, [| mkSet |]))
 
+(** [l <= l'], or [l < l'] when [strict] *)
+let level_constraint l ~strict l' =
+  let u = Universe.make l in
+  ((if strict then Universe.super u else u), UnivConstraint.Le, Universe.make l')
+
 let add_universe l ~lbound g =
-  let g = UGraph.add_universe l ~strict:false g in
-  UGraph.enforce_constraint (lbound, Le, l) g
+  let g = UGraph.add_universe l ~strict:false ~rigid:true g in
+  let g, _ = UGraph.enforce_constraint (level_constraint lbound ~strict:false l) g in
+  g
 
 let quickdef ?(opaque = false) ~name ~types ~univs body =
   let entry = Declare.definition_entry ~opaque ?types ~univs body in
@@ -137,7 +143,7 @@ let lean_scheme env ~dep mind u s =
         Level.Set.cardinal us = 1 && PConstraints.is_empty cst);
       let v = Level.Set.choose us in
       Vars.subst_univs_level_constr
-        (Sorts.QVar.Map.empty, Level.Map.singleton v s)
+        (Sorts.QVar.Map.empty, Level.Map.singleton v (Universe.make s))
         body
   in
 
@@ -351,21 +357,23 @@ let level_of_universe u =
   if lean_fancy_univs () then level_of_universe u else UnivGen.fresh_level ()
 
 let update_graph (l, u) (l', u') csts graph =
-  let open UnivConstraint in
   let cst =
     if UGraph.check_leq graph (Universe.super u) u' then
-      Some (l, Lt, l')
+      Some (l, true, l')
     else if UGraph.check_leq graph (Universe.super u') u then
-      Some (l', Lt, l)
+      Some (l', true, l)
     else if UGraph.check_leq graph u u' then
-      Some (l, Le, l')
+      Some (l, false, l')
     else if UGraph.check_leq graph u' u then
-      Some (l', Le, l)
+      Some (l', false, l)
     else None
   in
   match cst with
   | None -> csts, graph
-  | Some cst -> UnivConstraints.add cst csts, UGraph.enforce_constraint cst graph
+  | Some (l, strict, l') ->
+    let cst = level_constraint l ~strict l' in
+    let graph, _ = UGraph.enforce_constraint cst graph in
+    UnivConstraints.add cst csts, graph
 
 let is_sets u =
   match Universe.repr u with
@@ -385,7 +393,7 @@ let rec level_of_sets uconv n =
         else UnivGen.fresh_level ()
       in
       Global.push_context_set
-        (Level.Set.singleton l, UnivConstraints.singleton (p, Lt, l));
+        (Level.Set.singleton l, UnivConstraints.singleton (level_constraint p ~strict:true l));
       sets := Int.Map.add n l !sets;
       let graph = add_universe l ~lbound:p uconv.graph in
       ({ uconv with graph }, l)
@@ -403,7 +411,7 @@ let to_univ_level u uconv =
         let uconv, mset = level_of_sets uconv (max_increment u) in
         let l = level_of_universe u in
         let graph = add_universe l ~lbound:mset uconv.graph in
-        let csts = UnivConstraints.add (mset, Le, l) uconv.csts in
+        let csts = UnivConstraints.add (level_constraint mset ~strict:false l) uconv.csts in
         let csts, graph =
           Universe.Map.fold
             (fun u' l' (csts, graph) -> update_graph (l, u) (l', u') csts graph)
@@ -608,7 +616,7 @@ let start_uconv univs i =
           let v = univ_of_name u in
           ( N.Map.add u (Level v) uconv.map,
             add_universe v ~lbound:set1 uconv.graph,
-            UnivConstraints.add (set1, Le, v) uconv.csts)
+            UnivConstraints.add (level_constraint set1 ~strict:false v) uconv.csts)
         else (N.Map.add u LSProp uconv.map, uconv.graph, uconv.csts)
       in
       aux { uconv with map; graph; csts } (i / 2) univs
@@ -650,11 +658,13 @@ let univ_entry_gen { map; levels; graph; csts } ounivs =
   in
   let csts =
     UnivConstraints.filter
-      (fun (a, _, b) -> Level.Set.mem a uset || Level.Set.mem b uset)
+      (fun (a, _, b) ->
+        let mem u = Universe.exists (fun (l, _) -> Level.Set.mem l uset) u in
+        mem a || mem b)
       csts
   in
   let unames = { quals = [||]; univs = Array.of_list (make_unames univs ounivs)} in
-  let univs = Instance.of_array ([||], Array.of_list univs) in
+  let univs = LevelInstance.of_array ([||], Array.of_list univs) in
   let uctx = UContext.make unames (univs, PConstraints.of_univs csts) in
   let subst = snd (make_instance_subst univs) in
   let algs = List.rev_map (subst_univs_level_universe subst) algs in
@@ -662,7 +672,7 @@ let univ_entry_gen { map; levels; graph; csts } ounivs =
 
 let univ_entry a b =
   let uctx, algs = univ_entry_gen a b in
-  ((UState.Polymorphic_entry uctx, UnivNames.empty_binders), algs)
+  ((UState.Polymorphic_entry (uctx, None), UnivNames.empty_binders), algs)
 
 (* TODO restrict univs (eg [has_add : Sort (u+1) -> Sort(u+1)] can
    drop the [u] and keep only the replacement for [u+1]??
@@ -1249,7 +1259,7 @@ and instantiate n univs uconv =
   let uconv, univs =
     CList.fold_left_map (fun uconv u -> to_univ_level u uconv) uconv univs
   in
-  let u = Instance.of_array ([||], Array.of_list univs) in
+  let u = Instance.of_array ([||], CArray.map_of_list Universe.make univs) in
   (uconv, Constr.mkRef (inst.ref, u))
 
 and ensure_exists n i =
@@ -1396,7 +1406,7 @@ and declare_ind { name = n; params; ty; ctors; univs } i =
         | 0 ->
           UContext.make
             { quals = [||]; univs =  [| Name (Id.of_string "u") |]}
-            ( Instance.of_array ([||], [| univ_of_name (N.append N.anon "u") |]),
+            ( LevelInstance.of_array ([||], [| univ_of_name (N.append N.anon "u") |]),
               PConstraints.empty )
         | 1 -> UContext.empty
         | _ -> assert false
@@ -1532,8 +1542,7 @@ and declare_ind { name = n; params; ty; ctors; univs } i =
               };
             ];
           mind_entry_private = None;
-          mind_entry_universes = Polymorphic_ind_entry auctx;
-          mind_entry_variance = None;
+          mind_entry_universes = Polymorphic_ind_entry (auctx, None);
         }
       in
       let squashy = N.Map.get n Summary.Ref.(!squash_info) in
@@ -1544,7 +1553,7 @@ and declare_ind { name = n; params; ty; ctors; univs } i =
         let act finite =
           DeclareInd.declare_mutual_inductive_with_eliminations (entry finite)
             (* the ubinders API is kind of shit here *)
-            (UState.Polymorphic_entry UContext.empty, UnivNames.empty_binders)
+            (UState.Polymorphic_entry (UContext.empty, None), UnivNames.empty_binders)
             []
         in
         let act () = try act BiFinite with e -> act Finite in
@@ -1616,16 +1625,16 @@ and declare_ind { name = n; params; ty; ctors; univs } i =
       let { quals = qnames; univs = unames} = UContext.names univs in
       let uentry =
         match u with
-        | LSProp -> UState.Polymorphic_entry univs
+        | LSProp -> UState.Polymorphic_entry (univs, None)
         | Level u ->
           UState.Polymorphic_entry
             (UContext.make
                {quals = qnames; univs = Array.append [| Name (Id.of_string "motive") |] unames}
-               ( Instance.of_array
-                   ([||], Array.append [| u |] (snd (Instance.to_array inst))),
-                 csts ))
+               ( LevelInstance.of_array
+                   ([||], Array.append [| u |] (snd (LevelInstance.to_array inst))),
+                 csts ), None)
       in
-      (inst, uentry)
+      (Instance.of_level_instance inst, uentry)
     in
     (* lean 4 change: always dep? was not squashy.always_prop*)
     (lean_scheme env ~dep:true mind inst u, uentry)
